@@ -1,128 +1,158 @@
-from typing import List
-from fastapi import FastAPI, HTTPException, Depends
+import os
+import pickle
+from datetime import datetime
+from typing import Any, Dict, List
+
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI
+from loguru import logger
+
 from database import postgres_connection
-from schema import UserGet, PostGet, FeedGet
-from helpers import get_user, get_post, get_feed, get_recommended_feed
-
-# Инициализация FastAPI-приложения — точка входа для всех маршрутов
-app = FastAPI()
+from schema import PostGet
 
 
-# Функция для создания и закрытия подключения к базе данных.
-# Используется в Depends — FastAPI сам управляет подключением и закрытием.
-def get_conn():
+# === Вспомогательные функции ===
+def load_sql(query: str, dtypes: Dict[str, Any] = None) -> pd.DataFrame:
     """
-    Создаёт и возвращает подключение к PostgreSQL через psycopg2.
+    Выполняет SQL-запрос через соединение postgres_connection и возвращает DataFrame.
 
-    Подключение автоматически закрывается после выполнения запроса.
-    Используется как зависимость FastAPI.
+    Аргументы:
+        query: SQL-запрос
+        dtypes: словарь типов колонок для pd.read_sql (по умолчанию None)
+
+    Возвращает:
+        pd.DataFrame с результатом запроса
+
+    Исключения:
+        RuntimeError, если произошла ошибка при выполнении запроса
     """
     conn = postgres_connection()
+
     try:
-        yield conn  # отдаём соединение в обработчик запроса
+        df = pd.read_sql(query, conn, dtype=dtypes)
+    except Exception as e:
+        raise RuntimeError(
+            f"❌ Ошибка при выполнении SQL-запроса: {e}\nЗапрос: {query}"
+        ) from e
     finally:
-        conn.close()  # обязательно закрываем соединение после завершения
+        conn.close()
+
+    return df
 
 
-@app.get("/user/{id}", response_model=UserGet)
-def handle_get_user(id: int, conn=Depends(get_conn)) -> UserGet:
+def load_model(model_path: str = "model.pkl"):
     """
-    Получить информацию о пользователе по ID.
+    Загружает ML-модель из pickle-файла.
 
-    Параметры:
-        id (int): Уникальный идентификатор пользователя.
-
-    Возвращает:
-        UserGet: Данные пользователя в формате, пригодном для API.
+    Если код запускается в LMS-окружении (IS_LMS=1),
+    путь берётся из переменной окружения MODEL_PATH.
+    Иначе используется локальный путь, переданный пользователем.
 
     Исключения:
-        HTTPException 404 — если пользователь с заданным ID не найден.
+        FileNotFoundError — если файл модели не найден.
+        RuntimeError — если произошла ошибка при загрузке модели.
     """
-    user = get_user(conn, id)
-    if user is not None:
-        return UserGet(**user.__dict__)
-    raise HTTPException(404, f"User with id={id} not found")
+    if os.environ.get("IS_LMS", "0") == "1":
+        model_path = os.environ["MODEL_PATH"]
+
+    logger.info(f"Загрузка модели из файла {model_path}...")
+
+    try:
+        with open(model_path, "rb") as file:
+            model = pickle.load(file)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"❌ Файл модели не найден: {model_path}")
+    except Exception as e:
+        raise RuntimeError(f"❌ Ошибка при загрузке модели: {e}") from e
+
+    logger.success("Модель успешно загружена")
+
+    return model
 
 
-@app.get("/post/{id}", response_model=PostGet)
-def handle_get_post(id: int, conn=Depends(get_conn)) -> PostGet:
-    """
-    Получить информацию о посте по его ID.
+# === Загрузка основных ресурсов ===
+logger.info("Инициализация сервиса...")
 
-    Параметры:
-        id (int): Уникальный идентификатор поста.
+# Создаём объект FastAPI
+app = FastAPI()
 
-    Возвращает:
-        PostGet: Информация о посте (текст и тема).
+# Загружаем модель в память
+model = load_model(model_path='model/recommendation_model.pkl')
 
-    Исключения:
-        HTTPException 404 — если пост с заданным ID не найден.
-    """
-    post = get_post(conn, id)
-    if post is not None:
-        return PostGet(**post.__dict__)
-    raise HTTPException(404, f"Post with id={id} not found")
+# Фичи для предсказания
+user_features = load_sql('''SELECT * FROM "public"."evgenij-bulatov-jta6567_user_features"''')
+post_features = load_sql('''SELECT * FROM "public"."evgenij-bulatov-jta6567_post_features"''')
 
+# Посты в обычном виде
+post_info = load_sql('''SELECT * FROM public.post_text_df''')
 
-@app.get("/user/{id}/feed", response_model=List[FeedGet])
-def handle_get_user_feed(
-    id: int, limit: int = 10, conn=Depends(get_conn)
-) -> List[FeedGet]:
-    """
-    Получить список действий пользователя (лайки, просмотры) по его ID.
+# Список фичей в правильном порядке, в котором модель обучалась
+feature_columns = ['OneHot__os_iOS', 'OneHot__source_organic', 'MeanTarget__country',
+       'MeanTarget__city', 'MeanTarget__topic', 'month',
+       'day', 'hour', 'user_id',
+       'post_id', 'gender', 'age',
+       'exp_group', 'mean_tfidf_like_posts',
+       'lenght_post', 'tfidf_mean',
+       'tfidf_max', 'svd_column',
+       'rbf_centr_1', 'rbf_centr_2',
+       'rbf_centr_3', 'rbf_centr_4',
+       'rbf_centr_5', 'rbf_centr_6',
+       'rbf_centr_7', 'rbf_centr_8',
+       'rbf_centr_9', 'rbf_centr_10',
+       'favorite_topic']
 
-    Параметры:
-        id (int): Идентификатор пользователя.
-        limit (int): Максимальное количество действий в ответе (по умолчанию 10).
-
-    Возвращает:
-        List[FeedGet]: Список действий, отсортированных от новых к старым.
-    """
-    list_feed = get_feed(conn, user_id=id, limit=limit)
-    for row in list_feed:
-        row.user = UserGet(**row.user.__dict__)
-        row.post = PostGet(**row.post.__dict__)
-    return [FeedGet(**row.__dict__) for row in list_feed]
+logger.success("Сервис успешно инициализирован")
 
 
-@app.get("/post/{id}/feed", response_model=List[FeedGet])
-def handle_get_post_feed(
-    id: int, limit: int = 10, conn=Depends(get_conn)
-) -> List[FeedGet]:
-    """
-    Получить список действий пользователей с заданным постом.
-
-    Параметры:
-        id (int): Идентификатор поста.
-        limit (int): Максимальное количество действий (по умолчанию 10).
-
-    Возвращает:
-        List[FeedGet]: Список действий пользователей с этим постом,
-        отсортированный от новых к старым.
-    """
-    list_feed = get_feed(conn, post_id=id, limit=limit)
-    for row in list_feed:
-        row.user = UserGet(**row.user.__dict__)
-        row.post = PostGet(**row.post.__dict__)
-    return [FeedGet(**row.__dict__) for row in list_feed]
-
-
+# Эндпойнт для получения рекомендаций
 @app.get("/post/recommendations/", response_model=List[PostGet])
-def recommended_posts(
-    id: int, limit: int = 10, conn=Depends(get_conn)
-) -> List[PostGet]:
+def recommended_posts(user_id: int, dt: datetime, limit: int = 10) -> List[PostGet]:
     """
-    Получить рекомендованные посты (baseline-версия).
-
-    Возвращает топ-N популярных постов по количеству лайков.
-    Это базовая версия рекомендательной системы, одинаковая для всех пользователей.
-
-    Параметры:
-        id (int): ID пользователя (пока не используется, зарезервирован для будущей персонализации).
-        limit (int): Количество постов в выдаче (по умолчанию 10).
-
-    Возвращает:
-        List[PostGet]: Список популярных постов, отсортированных по убыванию лайков.
+    Возвращает список рекомендованных постов для пользователя на заданную дату и время.
     """
-    list_post = get_recommended_feed(conn, id, limit=limit)
-    return [PostGet(**row.__dict__) for row in list_post]
+    # В этом эндпойнте мы используем ранее загруженную модель и признаки.
+
+    # Временные признаки
+    month = int(dt.month)
+    day = int(dt.day)
+    hour = int(dt.hour)
+
+    # Формирование данных для рекомендации
+    df = post_features.copy()
+    df['user_id'] = user_id
+
+    user_row = user_features[user_features['user_id'] == user_id].iloc[0]
+    df['OneHot__os_iOS'] = user_row['OneHot__os_iOS']
+    df['OneHot__source_organic'] = user_row['OneHot__source_organic']
+    df['MeanTarget__country'] = user_row['MeanTarget__country']
+    df['MeanTarget__city'] = user_row['MeanTarget__city']
+    df['gender'] = user_row['gender']
+    df['age'] = user_row['age']
+    df['exp_group'] = user_row['exp_group']
+    df['mean_tfidf_like_posts'] = user_row['mean_tfidf_like_posts']
+
+    df['favorite_topic'] = 0
+
+    df['month'] = month
+    df['day'] = day
+    df['hour'] = hour
+
+    # Формирование данных в правильный порядок
+    df = df[feature_columns]
+
+    # Получаем предсказания в виде вероятностей
+    df['prediction'] = model.predict_proba(df)[:, 1]
+
+    # Формируем список limit постов, где самая высокая вероятность того, что пользователю понравится пост.
+    top_post_idx = df.nlargest(limit, 'prediction')['post_id'].tolist()
+
+    # Получаем рекомендованные посты в обычном виде
+    recs_posts = post_info[post_info['post_id'].isin(top_post_idx)]
+
+    recs = [
+        PostGet(id=item.post_id, text=item.text, topic=item.topic)
+        for item in recs_posts.itertuples()
+    ]
+
+    return recs
